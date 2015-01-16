@@ -1,0 +1,649 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#/home/larionovpa/fuse-driver/Project/FS
+
+import flickrapi
+import hashlib
+import xml.dom.minidom
+import sys
+import os
+
+import threading
+
+from urllib import urlopen, urlencode
+from time import time
+
+import fuse
+import stat
+#from fs.expose import fuse as fp
+
+#-----------------------------------------------------------------------ФОТОГРАФИЯ
+class Photo:
+	def __init__(self, IDnumber):
+		self.ID=IDnumber	#идентификатор фотографии
+		self.title = ""		#заголовок
+		self.posted=""		#дата загрузки
+		self.taken=""		#дата сьемки
+		self.lastupdate=""	#дата обновления
+		self.url = "" 		#URL
+		#----Структуры и дескрипторы
+		self.tags = [] 		#список тегов
+		self.sets = []	#список сетов
+		self.length = 0 #размер файла
+		self.data = '' #содержимое файла
+		pass
+
+	def __str__(self):
+		return str(self.title)
+
+	def ParseXML(self, Photo):
+		nodes = Photo.getElementsByTagName("title")
+		self.title = unicode(nodes[0].firstChild.nodeValue).encode('utf-8') 
+
+		nodes = Photo.getElementsByTagName("dates")
+		self.posted=unicode(nodes[0].getAttribute("posted")).encode('utf-8') 
+		self.taken=unicode(nodes[0].getAttribute("taken")).encode('utf-8') 
+		self.lastupdate=unicode(nodes[0].getAttribute("lastupdate")).encode('utf-8') 
+		
+		nodes = Photo.getElementsByTagName("url")
+		self.url = unicode(nodes[0].firstChild.nodeValue).encode('utf-8') 
+		
+		nodes = Photo.getElementsByTagName("tag")
+		for i in nodes:
+			self.tags.append(unicode(i.firstChild.nodeValue).encode('utf-8'))	
+		pass
+
+	def write(self, buf, offset):
+		if offset < len(self.data):
+			before = self.data[:offset]
+			after = self.data[offset+len(buf):]
+		else:
+			if offset > len(self.data):
+				self.truncate(offset)
+		before = self.data
+		after = ''
+		self.data = before + buf + after
+		self.length = len(self.data)	
+		return len(buf)
+
+	def read(self, size, offset):
+		return self.data[offset:offset+size]
+
+	def truncate(self, size):
+		if size < len(self.data):
+			self.data = self.data[:size]
+			self.stat.st_size = size
+		elif size > len(self.data):
+			self.data = self.data + '\0'*(size-len(self.data))
+			self.stat.st_size = size
+
+#-----------------------------------------------------------------------ТЕГ
+class Tag:
+	def __init__(self):
+		self.title = ""
+		pass
+
+	def  __str__(self):
+		return self.title
+
+	def ParseXML(self, pTag):
+		self.title = unicode(pTag.firstChild.nodeValue).encode('utf-8')
+		pass
+
+#-----------------------------------------------------------------------СЕТ
+class PhotoSet:
+	def __init__(self):
+		self.ID=""	#идентификатор тега
+		self.date_create = ""	#дата создания
+		self.date_update = ""	#дата обновления
+		self.title = ""		#заголовок
+		self.description = ""	#описание
+		pass
+
+	def __str__(self):
+		return self.title
+
+	def ParseXML(self, Photoset):
+		self.ID=unicode(Photoset.getAttribute("id")).encode('utf-8')
+		self.date_create = unicode(Photoset.getAttribute("date_create")).encode('utf-8')
+		self.date_update = unicode(Photoset.getAttribute("date_update")).encode('utf-8')
+
+		t = Photoset.getElementsByTagName('title')
+		if t:
+			self.title = unicode(t[0].firstChild.nodeValue).encode('utf-8')
+		
+		# Описания может и не быть/ Если понядобится - сделаем
+		pass
+
+class FileSystem(fuse.Fuse):	#Класс файловой системы (наследуется от fuse.Fuse):
+
+	api_key = 'd1a53660e6e03b91bf96f67a1a0c417e'
+	api_secret = '73dcd179dfc0d89f'
+
+	FS = dict()	#Файловая система
+
+	Photos = dict()	#Множество всех фотографий
+	UploadPhotos = list()	#Множество всех фотографий
+	Tags = list()	#Множество всех тегов
+	PhotoSets = list()	#Множество всех сетов
+	IDs = [] #список идентификаторов фотографий
+	
+	def __init__(self, *args, **kw):
+		
+		self.__RunLogFile__("log.txt")
+
+		self.__ConnectToFlickr__()
+	
+		self.__GetUserID__()
+		self.__GetTags__()
+		self.__GetPhotos__()
+
+		self.__GetPhotoSets__()
+		self.__ScanPhotoSetsForPhotos__()
+		
+		self.__ConstructFS__()
+		self.__PrintFS__(self.FS, 0)
+
+		fuse.fuse_python_api = (0, 2)
+		self.block_size = 1024
+		self.block_count = 4
+
+		self.currentDirectory = os.getcwd()
+		print self.currentDirectory 
+
+		fuse.Fuse.__init__(self, *args, **kw)
+
+		#print "----------------UserID:", self.user_id
+		#print "\n"
+		#print "----------------Sets:"
+		#for i in self.PhotoSets:
+		#	print "		",i
+		#print "\n"
+		#print "----------------Tags:",
+		#for i in self.Tags:
+		#	print "		",i
+		#print "\n"
+		#print "----------------Photos:"
+		#for i in self.Photos.keys():
+		#	print "		",self.Photos[i] 
+		#print "\n"
+
+		pass
+
+	def __del__(self):
+		self.__StopLogFile__()
+
+	def __RunLogFile__(self, fileName):
+		self.Log = open (fileName, 'w')
+		self.__ToLog__("----------- Logging is started -----------")
+
+	def __ToLog__(self, Message):
+		self.Log.write(str(time()) + ":	" + Message + "\r\n")
+		self.Log.flush()	
+
+	def __StopLogFile__(self):
+		self.__ToLog__("----------- Logging is stoped -----------")
+		self.Log.flush()
+		self.Log.close()		
+
+	#------------------------------ВЗАИМОДЕЙСТВИЕ С FLICKR.COM
+	def __ConnectToFlickr__(self):
+		self.flickr = flickrapi.FlickrAPI(self.api_key, self.api_secret) #загрузка ключей
+		#print flickr
+		try:
+			(self.token, frob) = self.flickr.get_token_part_one(perms='write')
+		except Exception as ex:
+			print "Flickr Connection Error: " + ex.args[0]
+			sys.exit(-1)
+		#print "token: ", self.token
+		if not self.token:
+			raw_input("Press <ENTER> after you authorized on FLICK.COM")
+		#запоминание токена и последующее его использование при вызове API
+		self.flickr.get_token_part_two((self.token, frob))
+		#print '	Connected to Flickr'
+		pass
+
+	def __DoFlickrMethod__(self, method, **params):	#Возвращает XML структуру dom после её парсинга.
+		sortedParamsList=[]	#список параметров метода
+		urlEncodeList = []
+		for key in sorted(params.iterkeys()):
+    			sortedParamsList.append(key)
+			sortedParamsList.append(params[key])
+			urlEncodeList.append(urlencode({key:params[key]}))
+		urlEncodeStr = '&'.join(urlEncodeList)
+
+		#вычисляем значение параметра api_sig используемого в выше описанной ссылке, как ключ доступа к фс пользователя
+	    	api_sig=hashlib.md5(self.api_secret+'api_key'+self.api_key+'auth_token'+self.token+'method'+method+''.join(sortedParamsList)).hexdigest()
+		#формируем ссылку
+	    	url='http://www.flickr.com/services/rest/?api_key='+self.api_key+'&auth_token='+self.token+'&method='+method+'&'+urlEncodeStr+'&api_sig='+api_sig
+		#print url
+		resp = urlopen(url)
+		
+		#print resp
+	    	dom = xml.dom.minidom.parse(resp) #получаем ответ и выполняем его парсинг
+		nodes = dom.getElementsByTagName('rsp')
+		stat = nodes[0].getAttribute("stat").upper()
+		#print stat
+		if stat!='OK':
+			nodes = dom.getElementsByTagName('err')
+			if nodes!=[]:
+				stat=nodes[0].getAttribute("msg")
+			raise ValueError(stat)
+		else:
+		    	return dom
+
+	def __GetUserID__(self):
+		method = 'flickr.urls.getUserPhotos'
+		try:
+			dom = self.__DoFlickrMethod__(method)
+		except Exception as ex:
+			print ex.args[0]
+			sys.exit(-1)
+		
+		nodes = dom.getElementsByTagName("user")
+		FileSystem.user_id = nodes[0].getAttribute("nsid")
+		#print FileSystem.user_id
+		pass
+
+	def __GetPhotoSets__(self):
+		method = 'flickr.photosets.getList'
+		try:
+			dom = self.__DoFlickrMethod__(method)
+		except Exception as ex:
+			print ex.args[0]
+			sys.exit(-1)
+
+		nodes = dom.getElementsByTagName("photoset")
+
+		for i in nodes:
+			iSet = PhotoSet()
+			iSet.ParseXML(i)
+			#print iSet.ID
+			#print iSet.date_create
+			#print iSet.title
+			self.PhotoSets.append(iSet)
+		pass
+
+	def __GetTags__(self):
+		method = 'flickr.tags.getListUser'
+		try:
+			dom = self.__DoFlickrMethod__(method)
+		except Exception as ex:
+			print ex.args[0]
+			sys.exit(-1)
+
+		nodes = dom.getElementsByTagName("tag")
+
+		for i in nodes:
+			iTag = Tag()
+			iTag.ParseXML(i)
+			#print iTag.pTag
+			self.Tags.append(iTag)
+		pass
+
+
+	def __GetPhotos__(self, pTag = ""):		
+		method = 'flickr.photos.search'
+		if self.user_id==False:
+			return
+		pPage = "1"
+
+		iCount = 1
+		bContinue = True#, page=pPage
+		while bContinue:
+			try:
+				dom = self.__DoFlickrMethod__(method,page=pPage,user_id=self.user_id)
+			except Exception as ex:
+				print ex.args[0]
+				sys.exit(-1)		
+	
+			nodes = dom.getElementsByTagName("photos")
+			if iCount==1:
+				try:
+					iPages = int(nodes[0].getAttribute("pages"))
+					#print iPages
+				except ValueError:
+					print ex.args[0]
+					sys.exit(-1)
+			
+			nodes = dom.getElementsByTagName("photo")
+			for i in nodes:
+				ID = i.getAttribute("id")
+				self.IDs.append(ID)		#будем использовать в функции read (для определения ссылки на файл функцией PhotosSizesFromIds) и в функции open
+				#print ID
+				if (self.Photos.get(ID, -1)==-1):
+					self.Photos[ID] = Photo(ID)
+					self.Photos[ID].ParseXML(self.__GetPhotoInfo__(ID))
+			
+			iCount+=1			
+			pPage = str(iCount)
+			if iCount>iPages: bContinue=False
+		pass	
+
+	def __GetPhotoInfo__(self, ID):
+		method = 'flickr.photos.getInfo'
+		try:
+			dom = self.__DoFlickrMethod__(method, photo_id=ID)
+		except Exception as ex:
+			print ex.args[0]
+			sys.exit(-1)
+
+		return dom
+
+
+	def __ScanPhotoSetsForPhotos__(self):
+		method = 'flickr.photosets.getPhotos'
+		for i in self.PhotoSets:
+			try:
+				dom = self.__DoFlickrMethod__(method, photoset_id=i.ID)
+			except Exception as ex:
+				print ex.args[0]
+				sys.exit(-1)
+
+			nodes = dom.getElementsByTagName("photo")
+			for j in nodes:
+				photoID = unicode(j.getAttribute("id")).encode('utf-8')
+				self.Photos[photoID].sets.append(i)
+
+
+	def __PhotosSizesFromIds__(self, ID): #в функцию передается id фотографии
+		method = 'flickr.photos.getSizes'   #вызов метода для получения ссылок на все размеры данного изображения
+		dom = self.__DoFlickrMethod__(method, photo_id=ID)
+		url_nodes = dom.getElementsByTagName("size")
+		urls_id=[]
+		for el in url_nodes:
+			urls_id.append(el.getAttribute("source").encode('utf-8'))
+		return urls_id[len(urls_id)-1]    #возвращаем последнюю ссылку (на самое большое изображения Large)  
+
+
+	def __ConstructFS__(self):
+		self.FS['Tags'] = dict() 
+		t = self.FS['Tags']
+		for i in self.Tags:
+			t[i.title] = dict()		
+		
+		self.FS['Sets'] = dict()
+		s = self.FS['Sets']
+		for i in self.PhotoSets:
+			s[i.title] = dict()
+
+		self.FS['Upload'] = dict()
+
+		self.FS['Resolutions'] = dict()	
+
+		resDictionary = dict ()
+
+		for i in self.Photos.keys():
+			resDictionary[self.Photos[i].title] = self.Photos[i]
+
+		(self.FS['Resolutions'])['Square (75 x 75)'] = resDictionary
+		(self.FS['Resolutions'])['Thumbnail (100 x 75)'] = resDictionary
+		(self.FS['Resolutions'])['Small (240 x 180)'] = resDictionary
+		(self.FS['Resolutions'])['Medium 500 (500 x 375)'] = resDictionary
+		(self.FS['Resolutions'])['Medium 640 (640 x 480)'] = resDictionary
+		(self.FS['Resolutions'])['Large (1024 x 768)'] = resDictionary
+
+		for i in self.Photos.keys():
+			photoTitle = self.Photos[i].title
+			photoObj = self.Photos[i]
+
+			if photoObj.tags == []:
+				t[photoTitle] = photoObj
+			else:
+				for iT in photoObj.tags:
+					if(t.get(str(iT), -1)==-1): print "Tag error! ",iT
+					else: (t[str(iT)])[photoTitle] = photoObj
+
+			if self.Photos[i].sets == []:
+				s[photoTitle] = self.Photos[i]
+			else:
+				for iS in photoObj.sets:
+					if(s.get(str(iS), -1)==-1): print "Set error! ", iS
+					else: (s[str(iS)])[photoTitle] = photoObj
+		pass
+
+	def __PrintFS__(self, Folder, j):
+		for i in Folder.keys():
+
+			if (isinstance(Folder[i], dict)):
+				print "    "*j, "-", i
+				self.__PrintFS__(Folder[i], j+1)
+			else:
+				print "    "*j, "-", Folder[i]
+
+	def __PrintFSToLog__(self, Folder, j):
+		for i in Folder.keys():
+			if type(Folder[i]) == type(dict()):
+				self.__ToLog__(str("		"*j + "-" + i))				
+			else:
+				self.__ToLog__(str("		"*j + "-" + Folder[i]))
+
+
+	def __UpdateFS__(self):
+		self.__ToLog__("__UpdateFS__: ")
+			
+	#------------------------------ИНТЕРФЕЙС FUSE
+	def getattr(self, path):	# получение информации об объекте через fuse.Stat()
+		self.__ToLog__("getattr: path = " + path)
+		st = fuse.Stat()
+		st.st_mode = stat.S_IFDIR | 0755
+		st.st_ino = 0
+		st.st_dev = 0
+		st.st_nlink = 2
+		st.st_uid = 0
+		st.st_gid = 0
+		st.st_size = 0
+		st.st_atime = int(time())
+		st.st_mtime = st.st_atime
+		st.st_ctime = st.st_atime
+
+		t = self.FS
+		for i in path[1:].split('/'):
+			if (i!='' and t!=-1):
+				t = t.get(i, -1)
+	
+
+		if path.find("/Upload/")!=-1 and path.find("/.")==-1 and len(path)>8:
+			if t!=(-1):
+				st.st_mode = stat.S_IFREG | 0666
+				st.st_nlink = 1
+				st.st_size = t.length
+				self.__ToLog__("	/upload/ old photo: " + path + " size: " + str(st.st_size))
+				return st
+			else:
+				fPath = str(path)
+				fName = fPath.split("/")[2]
+				newPhoto = Photo(fName)
+				(self.FS['Upload'])[fName] = newPhoto
+				newPhoto.title = fName
+
+				st.st_mode = stat.S_IFREG | 0666
+				st.st_nlink = 1
+				st.st_size = 0
+				self.__ToLog__("	/upload/ new photo: " + path + " size: " +  str(st.st_size))
+				return st
+								
+		if t!=-1:
+			if type(t) == type(dict()):
+				st.st_mode = stat.S_IFDIR | 0755
+				st.st_nlink = 3
+				self.__ToLog__("	folder")
+				return st
+			
+			else:
+				st.st_mode = stat.S_IFREG | 0444
+				st.st_nlink = 1
+				for ID in self.IDs:	#перебор всех ID фотографий и сравнение имен полученным по этим ID с текущем именем файла - t, чтобы определить с каким ID вызывать PhotosSizesFromIds ответственную за получение ссылки на изображение по ID. (если есть способ получить текущий id проще, я не против изменений. Такой же метод используется в функции open и read.
+					if self.Photos[ID]==t:
+						url = self.__PhotosSizesFromIds__(ID)
+						fileURL = urlopen(url)
+						stOfFile = fileURL.info().get('Content-Length')
+						if stOfFile is None:
+							sizeOfFile = 0
+						else:
+							sizeOfFile = int(stOfFile)
+				st.st_size = sizeOfFile
+				self.__ToLog__("	file")
+				return st
+
+		self.__ToLog__("	no entry")		
+		return -errno.ENOENT
+
+
+	def statfs(self): #запрос информации о ФС
+		self.__ToLog__("statfs:")
+		st = fuse.StatVfs()
+		# Размер блока
+		st.f_bsize = self.block_size
+		st.f_bfree = 1024
+		st.f_bavail = 1024
+		st.f_frsize = 1024
+		# Количество блоков
+		st.f_blocks = self.block_count
+		# Количество файлов
+		st.f_files = self.Photos.keys().count()
+		return st
+
+
+	def readdir(self, path, offset):# просмотр содержимого каталога.
+		self.__ToLog__("readdir: path = " + str(path) + " offset = " + str(offset))
+
+		dirents = ['.', '..']
+
+		t = self.FS
+		strPath = str(path)
+
+
+		if strPath=='/':
+			dirents.extend(t.keys())
+		else:
+			for i in strPath.split('/'):
+				if (i!=''):
+					t = t.get(i, -1)
+	
+			if (t!=-1):
+				#self.__ToLog__("readdir: " + str(t))
+				if type(t) == type(dict()):
+					dirents.extend(t.keys())
+
+		for i in dirents:
+			self.__ToLog__("	" + i)
+			yield fuse.Direntry(i)
+	  
+
+
+	#------------------------------------------FUSE FILE OPERATIONS
+
+	def open(self, path, flags):
+		self.__ToLog__("open:"+ " path = " + str(path)+ " flags =" + str(flags))
+
+		if path.find("/Upload/")!=-1 and path.find("/.")==-1 and len(path)>8:
+			self.__ToLog__("	/Upload/")
+			return True
+
+		check=0
+		t = self.FS
+		strPath = str(path)
+		for i in path[1:].split('/'):
+			if (i!=''):
+				t = t.get(i, -1)
+		if (t!=-1):
+			if type(t) != type(dict()):
+				for ID in self.IDs:
+					if self.Photos[ID]==t:
+						check=1
+		if check!=1:
+			self.__ToLog__("	ENOENT")
+			return -errno.ENOENT
+		accmode = os.O_RDONLY | os.O_WRONLY | os.O_RDWR
+		if (flags & accmode) != os.O_RDONLY:		#Ошибка доступа
+			self.__ToLog__("	EACCES")
+			return -errno.EACCES
+
+	def read(self, path, length, offset, fh=None):
+		self.__ToLog__("read: "+ "path = " + str(path)+ " length = " + str(length)+ " offset = " + str(offset))
+
+		if path.find("/Upload/")!=-1 and len(path)>8:
+			fPath = str(path)
+			fName = fPath.split("/")[2]
+			t = (self.FS['Upload'])[fName]
+			retVal = t.read(length, offset)
+			self.__ToLog__("	/Upload/: " + str(len(retVal)))		
+			return retVal
+
+		t = self.FS
+		strPath = str(path)
+		check=0
+		for i in path[1:].split('/'):
+			if (i!=''):
+				t = t.get(i, -1)
+		if (t!=-1):
+			if type(t) != type(dict()):
+				for ID in self.IDs:
+					if self.Photos[ID]==t:
+						check=1
+						url = self.__PhotosSizesFromIds__(ID)
+						data = urlopen(str(url)).read()
+						slen = len(data)
+						if offset < slen:
+							if offset + length > slen:
+								length = slen - offset
+							buf = data[offset:offset+length]
+						else:
+							buf=''	
+
+		if check!=1:
+		#Ошибка чтения
+			self.__ToLog__("	ENOENT")	
+			return -errno.ENOENT
+		self.__ToLog__("	" + str(len(buf)))		
+		return buf
+
+	def __UploadPhoto__(self, path):
+		self.__ToLog__("		UploadPhoto Started Thread: " + path)
+		result = self.flickr.upload(filename=path, is_public=u'1', is_family=u'1', is_friend=u'1')
+		photo_id = result.find('photoid').text
+		self.__ToLog__("		UploadPhoto: OK " + photo_id)
+
+	def write(self, path, buf, offset, fh=None):
+		self.__ToLog__("write: path = " + str(path)+ " offset =" + str(offset) + " buf =" + str(len(buf)))
+
+		if path.find("/Upload/")!=-1 and path.find("/.")==-1 and len(path)>8:
+			t = self.FS
+			strPath = str(path)
+			for i in strPath.split('/'):
+				if (i!=''):
+					t = t.get(i, -1)
+			if t!=-1:
+				if type(t)==type(Photo(-1)):
+					retVal = t.write(buf, offset)					
+
+					if (len(buf)<self.block_size*self.block_count):
+						self.__ToLog__("		We can UPDATE!")
+						path = self.currentDirectory +"/"+sys.argv[1]+path
+						
+						self.__ToLog__("		UploadPhoto: " + path)
+						
+						self.t = threading.Thread(target=self.__UploadPhoto__, args=(path,))
+						self.t.daemon = False
+						self.t.start()
+					self.__ToLog__("	" + str(retVal))
+					return retVal
+		self.__ToLog__("	EACCES")
+		return -errno.EACCES
+
+
+	def unlink(self, path):
+		self.__ToLog__("unlink:"+ " " + str(path))
+
+#--------------------------------------------------MAIN
+if __name__ == '__main__':
+	print sys.argv
+	sUsage='FileSystem ' + fuse.Fuse.fusage
+	FS = FileSystem(version="%prog " + fuse.__version__, usage=sUsage, dash_s_do='setsingle', )
+	FS.parse(errex=1)
+	FS.main()
+
+
+
+
